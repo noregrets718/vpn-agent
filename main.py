@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import signal
+from contextlib import asynccontextmanager
 from pathlib import Path
 import httpx
 import time
@@ -25,7 +26,6 @@ SS_BINARY = os.environ.get("SS_BINARY_PATH", "/usr/bin/ss-server")
 CONFIG_DIR = Path(os.environ.get("SS_CONFIG_DIR", "/etc/shadowsocks-libev/users"))
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="VPN Node Agent")
 
 _processes: dict[int, asyncio.subprocess.Process] = {}
 _prev_traffic: dict[int, dict[str, int]] = {}
@@ -107,6 +107,55 @@ async def _remove_iptables(port: int):
       await proc.wait()
 
 
+async def _launch_instance(config_path: Path, port: int) -> None:
+    """Start ss-server process and set up iptables rules."""
+    await asyncio.create_subprocess_exec(
+        SS_BINARY,
+        "-c",
+        str(config_path),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await _setup_iptables(port)
+    logger.info(f"Started SS on port {port}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── startup ──────────────────────────────────────────────────────────────
+    recovered = 0
+    for config_file in CONFIG_DIR.glob("ss-*.json"):
+        try:
+            config = json.loads(config_file.read_text())
+            port = int(config["server_port"])
+            if _find_pid_by_port(port):
+                logger.info(f"Port {port} already running, skipping recovery")
+                continue
+            await _launch_instance(config_file, port)
+            recovered += 1
+        except Exception as e:
+            logger.error(f"Failed to recover instance from {config_file}: {e}")
+
+    logger.info(f"Startup recovery complete: {recovered} instance(s) restored")
+
+    yield
+
+    # ── shutdown ─────────────────────────────────────────────────────────────
+    for config_file in CONFIG_DIR.glob("ss-*.json"):
+        try:
+            config = json.loads(config_file.read_text())
+            port = int(config["server_port"])
+            await _remove_iptables(port)
+            logger.info(f"Removed iptables rules for port {port}")
+        except Exception as e:
+            logger.error(f"Failed to clean up iptables for {config_file}: {e}")
+
+    logger.info("Shutdown cleanup complete")
+
+
+app = FastAPI(title="VPN Node Agent", lifespan=lifespan)
+
+
 @app.post("/instances", status_code=status.HTTP_201_CREATED, dependencies=[Depends(verify_token)])
 async def start_instance(req: InstanceRequest):
   port = req.port
@@ -115,13 +164,7 @@ async def start_instance(req: InstanceRequest):
 
   config_path = _write_config(port, req.password, req.method)
   try:
-      proc = await asyncio.create_subprocess_exec(
-          SS_BINARY, "-c", str(config_path),
-          stdout=asyncio.subprocess.DEVNULL,
-          stderr=asyncio.subprocess.PIPE,
-      )
-      await _setup_iptables(port)
-      logger.info(f"Started SS on port {port}, PID={proc.pid}")
+      await _launch_instance(config_path, port)
       return {"port": port, "status": "started"}
   except Exception as e:
       logger.error(f"Failed to start SS on port {port}: {e}")
